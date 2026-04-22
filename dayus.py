@@ -1313,6 +1313,8 @@ class DayusTab(tk.Frame):
 
     def destroy(self):
         _STATE.remove_listener(self._on_live_event)
+        self._live = None
+        self._out  = None
         super().destroy()
 
     # ── Build UI ──────────────────────────────────────────────────────────
@@ -1462,10 +1464,15 @@ class DayusTab(tk.Frame):
 
     def _write(self, text: str, tag: str = "info"):
         def _do():
-            self._out.configure(state="normal")
-            self._out.insert("end", text + "\n", tag)
-            self._out.configure(state="disabled")
-            self._out.see("end")
+            try:
+                if not self._out.winfo_exists():
+                    return
+                self._out.configure(state="normal")
+                self._out.insert("end", text + "\n", tag)
+                self._out.configure(state="disabled")
+                self._out.see("end")
+            except Exception:
+                pass
         try:
             self.after(0, _do)
         except Exception:
@@ -1473,22 +1480,35 @@ class DayusTab(tk.Frame):
 
     def _clear_out(self):
         def _do():
-            self._out.configure(state="normal")
-            self._out.delete("1.0", "end")
-            self._out.configure(state="disabled")
-        self.after(0, _do)
+            try:
+                if not self._out.winfo_exists():
+                    return
+                self._out.configure(state="normal")
+                self._out.delete("1.0", "end")
+                self._out.configure(state="disabled")
+            except Exception:
+                pass
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
 
     def _write_live(self, text: str, tag: str = "info"):
         def _do():
-            self._live.configure(state="normal")
-            self._live.insert("end", text + "\n", tag)
-            # Keep log trimmed
-            lines = int(self._live.index("end-1c").split(".")[0])
-            if lines > 800:
-                self._live.delete("1.0", "300.0")
-            self._live.configure(state="disabled")
-            if self._live_enabled.get():
-                self._live.see("end")
+            try:
+                if not self._live.winfo_exists():
+                    return
+                self._live.configure(state="normal")
+                self._live.insert("end", text + "\n", tag)
+                # Keep log trimmed
+                lines = int(self._live.index("end-1c").split(".")[0])
+                if lines > 800:
+                    self._live.delete("1.0", "300.0")
+                self._live.configure(state="disabled")
+                if self._live_enabled.get():
+                    self._live.see("end")
+            except Exception:
+                pass
         try:
             self.after(0, _do)
         except Exception:
