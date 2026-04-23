@@ -16,5 +16,18 @@
     "name":        "Tab Shortcuts",
     "version":     "1.1.0",
     "description": "Atajos de teclado pa' las pestañas"
+  },
+  {
+    "file":        "maurisio.py",
+    "name":        "Maurisio",
+    "version":     "1.0.0",
+    "description": "Agente de IA"
+  },
+  {
+    "file":        "mrupdater.py",
+    "name":        "Maurisio updater",
+    "version":     "1.0.0",
+    "description": "Updater con maurisio"
   }
+  
 ]
