@@ -453,9 +453,13 @@ class MaurisioTab(tk.Frame):
     # ── Construcción de UI ────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Cabecera
+        # Usar grid en el frame principal para controlar el layout con precisión
+        self.grid_rowconfigure(2, weight=1)   # fila del chat — crece
+        self.grid_columnconfigure(0, weight=1)
+
+        # Cabecera — fila 0
         hdr = tk.Frame(self, bg=C["surface"], pady=8, padx=16)
-        hdr.pack(fill="x")
+        hdr.grid(row=0, column=0, sticky="ew")
 
         tk.Label(hdr, text="🤙  Maurisio",
                  font=F_TITLE, bg=C["surface"], fg=C["accent"]).pack(side="left")
@@ -477,23 +481,23 @@ class MaurisioTab(tk.Frame):
                   font=F_SMALL, relief="flat", cursor="hand2",
                   padx=8, pady=3, activebackground=C["btn_h"]).pack(side="left")
 
-        # Status bar
+        # Status bar — fila 1
         self._status_bar = tk.Frame(self, bg=C["surface2"], pady=4)
-        self._status_bar.pack(fill="x")
+        self._status_bar.grid(row=1, column=0, sticky="ew")
         self._status_lbl = tk.Label(
             self._status_bar, text="⏳ Comprobando si Ollama está por ahí...",
             font=F_SMALL, bg=C["surface2"], fg=C["muted"],
         )
         self._status_lbl.pack(side="left", padx=12)
 
-        # Panel de setup (se muestra en el centro mientras no está listo)
+        # Panel de setup — fila 2 (ocupa el espacio central mientras carga)
         self._setup_area = tk.Frame(self, bg=C["bg"])
-        self._setup_area.pack(fill="both", expand=True)
+        self._setup_area.grid(row=2, column=0, sticky="nsew")
 
-        # Panel de comandos propuestos
+        # Panel de comandos propuestos — fila 3 (oculto hasta que haya comandos)
         self._cmd_panel = tk.Frame(self, bg=C["cmd_bg"])
 
-        # Chat (oculto hasta que esté listo)
+        # Chat — fila 2 también (sustituye al setup_area cuando está listo)
         self._chat_frame = tk.Frame(self, bg=C["console_bg"])
 
         self._chat = tk.Text(
@@ -519,7 +523,7 @@ class MaurisioTab(tk.Frame):
                                   lmargin1=8, lmargin2=8)
         self._chat.tag_configure("thinking",  foreground=C["muted"],   font=("Segoe UI", 9, "italic"))
 
-        # Quick prompts
+        # Quick prompts — fila 3
         self._quick_bar = tk.Frame(self, bg=C["bg"], pady=3)
         tk.Label(self._quick_bar, text="Quick:",
                  font=F_SMALL, bg=C["bg"], fg=C["muted"]).pack(side="left", padx=(12, 6))
@@ -540,7 +544,7 @@ class MaurisioTab(tk.Frame):
                 activeforeground=C["text"],
             ).pack(side="left", padx=2)
 
-        # Input
+        # Input — fila 4 (siempre abajo del todo)
         self._input_frame = tk.Frame(self, bg=C["surface"], pady=8, padx=12)
 
         tk.Label(self._input_frame, text="❯",
@@ -570,6 +574,10 @@ class MaurisioTab(tk.Frame):
             state="disabled",
         )
         self._send_btn.pack(side="right", padx=(8, 0))
+
+        # Colocar quick_bar e input_frame en el grid (siempre visibles)
+        self._quick_bar.grid(row=3, column=0, sticky="ew")
+        self._input_frame.grid(row=4, column=0, sticky="ew")
 
     # ── Setup automático ──────────────────────────────────────────────────
 
@@ -789,17 +797,11 @@ class MaurisioTab(tk.Frame):
         self._model = model
         self._state = self.ST_READY
 
-        # Ocultar setup, mostrar chat
+        # Ocultar setup, mostrar chat en la misma fila 2
         for w in self._setup_area.winfo_children():
             w.destroy()
-        self._setup_area.pack_forget()
-
-        self._chat_frame.pack(fill="both", expand=True)
-        # Con side="bottom" el orden es inverso: lo último en packearse queda más arriba.
-        # Input abajo del todo → se packea el primero
-        self._input_frame.pack(fill="x", side="bottom")
-        # Quick bar encima del input → se packea después
-        self._quick_bar.pack(fill="x", side="bottom")
+        self._setup_area.grid_forget()
+        self._chat_frame.grid(row=2, column=0, sticky="nsew")
 
         # Activar input y bindear Return DESPUÉS de habilitar el widget
         self._input.config(state="normal")
@@ -997,7 +999,10 @@ class MaurisioTab(tk.Frame):
     def _show_cmd_panel(self, commands: list[str]):
         for w in self._cmd_panel.winfo_children():
             w.destroy()
-        self._cmd_panel.pack(fill="x", before=self._status_bar, pady=0)
+        # Insertar cmd_panel en fila 3, empujando quick y input hacia abajo
+        self._cmd_panel.grid(row=3, column=0, sticky="ew")
+        self._quick_bar.grid(row=4, column=0, sticky="ew")
+        self._input_frame.grid(row=5, column=0, sticky="ew")
 
         hdr = tk.Frame(self._cmd_panel, bg="#1c1408", pady=6, padx=12)
         hdr.pack(fill="x")
@@ -1031,9 +1036,12 @@ class MaurisioTab(tk.Frame):
                       padx=8, pady=3).pack(side="right")
 
     def _hide_cmd_panel(self):
-        self._cmd_panel.pack_forget()
+        self._cmd_panel.grid_forget()
         for w in self._cmd_panel.winfo_children():
             w.destroy()
+        # Restaurar posiciones normales
+        self._quick_bar.grid(row=3, column=0, sticky="ew")
+        self._input_frame.grid(row=4, column=0, sticky="ew")
 
     def _exec_cmd(self, cmd_str: str):
         self._append_sys(f"Ejecutando: {cmd_str}")
