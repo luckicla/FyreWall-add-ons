@@ -50,6 +50,18 @@ _STATE_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ipman
 _CF           = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _CF_CONSOLE   = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
+# ─── CREDENCIALES DE AULA ────────────────────────────────────────────────────
+_AULA_USER = "AulaPalcam"
+_AULA_PASS = "Palcam1956"
+
+# Referencia a la instancia de FyreWallApp (inyectada por FyreWall al cargar el plugin)
+_FYREWALL_APP = None
+
+def _set_app(app):
+    """FyreWall llama a esto al cargar el plugin para inyectar la referencia a la app."""
+    global _FYREWALL_APP
+    _FYREWALL_APP = app
+
 # ─── STATE HELPERS ───────────────────────────────────────────────────────────
 
 def _read_state() -> dict:
@@ -224,21 +236,70 @@ def _scan_active_ips() -> list[dict]:
     return results
 
 def _scan_local_network() -> list[str]:
-    """Escanea la red local con ARP."""
-    hosts = []
+    """
+    Descubre hosts activos en la red local.
+    Ping sweep en lotes de 20 hilos para no saturar el switch,
+    con 80ms de timeout por ping — rápido pero sin floodear.
+    """
+    my_ips = _get_local_ips()
+    prefixes = list({ip.rsplit(".", 1)[0] + "." for ip in my_ips})
+    if not prefixes:
+        prefixes = ["192.168.1."]
+
+    alive = []
+
+    def _ping(ip):
+        try:
+            r = subprocess.run(
+                ["ping", "-n", "1", "-w", "80", ip],
+                capture_output=True, timeout=1, creationflags=_CF
+            )
+            if r.returncode == 0:
+                alive.append(ip)
+        except Exception:
+            pass
+
+    for prefix in prefixes:
+        ips = [f"{prefix}{i}" for i in range(1, 255)]
+        # Lotes de 20 hilos — rápido pero sin masacrar el switch
+        batch_size = 20
+        for i in range(0, len(ips), batch_size):
+            batch = ips[i:i+batch_size]
+            threads = [threading.Thread(target=_ping, args=(ip,), daemon=True) for ip in batch]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=1.5)
+            time.sleep(0.05)  # 50ms entre lotes
+
+    # Complementar con arp -a (coge los que no respondieron al ping pero están en caché)
+    seen = set(alive)
     try:
         out = subprocess.check_output(
-            ["arp", "-a"], text=True, timeout=10, creationflags=_CF
+            ["arp", "-a"], text=True, timeout=10,
+            creationflags=_CF, encoding="cp850", errors="replace"
         )
         for line in out.splitlines():
-            m = re.search(r"([\d]{1,3}(?:\.[\d]{1,3}){3})", line)
+            m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
             if m:
                 ip = m.group(1)
-                if not ip.startswith("127.") and ip not in hosts:
-                    hosts.append(ip)
+                if (not ip.startswith("127.")
+                        and not ip.endswith(".255")
+                        and not ip.endswith(".0")
+                        and ip not in seen):
+                    seen.add(ip)
+                    alive.append(ip)
     except Exception:
         pass
-    return hosts
+
+    def _sort_key(ip):
+        try:
+            return tuple(int(x) for x in ip.split("."))
+        except Exception:
+            return (0,0,0,0)
+
+    alive.sort(key=_sort_key)
+    return alive
 
 def _scan_vulnerable_ports() -> list[dict]:
     """Escanea puertos vulnerables en localhost."""
@@ -276,53 +337,328 @@ def _scan_vulnerable_ports() -> list[dict]:
             pass
     return found
 
-def _send_troll_message(ip: str, message: str) -> tuple[bool, str]:
-    """Envía un popup de alerta a una IP de la red local mediante msg.exe."""
+def _mount_ipc(ip: str) -> tuple[bool, str]:
+    """
+    Monta IPC$ en el host remoto via SMB (puerto 445/139).
+    Devuelve (ok, msg).
+    """
+    ps = (
+        f"net use \\\\{ip}\\IPC$ '{_AULA_PASS}' /user:{_AULA_USER} 2>&1"
+    )
     try:
-        # msg.exe funciona en redes locales Windows con NetBIOS
         r = subprocess.run(
-            ["msg", "/server:" + ip, "*", message],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_CF
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=10, creationflags=_CF
         )
-        if r.returncode == 0:
-            return True, f"  ✅  Mensaje enviado a {ip}"
-        # Fallback: net send (sistemas muy viejos)
-        r2 = subprocess.run(
-            ["net", "send", ip, message],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_CF
-        )
-        if r2.returncode == 0:
-            return True, f"  ✅  Mensaje enviado a {ip} (net send)"
-        return False, (
-            f"  ⚠️  No se pudo enviar a {ip}.\n"
-            f"  ℹ️  msg.exe requiere que el host tenga el servicio 'Messenger' activo\n"
-            f"       y que esté en la misma red local con NetBIOS habilitado.\n"
-            f"  Salida: {(r.stderr or r.stdout).strip()}"
-        )
-    except FileNotFoundError:
-        return False, "  ❌  msg.exe no encontrado en este sistema."
+        if r.returncode == 0 or "already" in (r.stdout + r.stderr).lower():
+            return True, f"  ✅  IPC$ montado en {ip}"
+        return False, f"  ❌  No se pudo montar IPC$ en {ip}: {(r.stdout + r.stderr).strip()[:120]}"
+    except subprocess.TimeoutExpired:
+        return False, f"  ❌  Timeout conectando a {ip}"
     except Exception as e:
         return False, f"  ❌  Error: {e}"
 
-def _shutdown_device(ip: str) -> tuple[bool, str]:
-    """Envía un shutdown a un dispositivo de la red local (requiere privilegios)."""
+
+def _unmount_ipc(ip: str):
+    """Desmonta IPC$ del host remoto."""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"net use \\\\{ip}\\IPC$ /delete /y 2>$null"],
+            capture_output=True, timeout=8, creationflags=_CF
+        )
+    except Exception:
+        pass
+
+
+def _connect_admin_console(ip: str) -> tuple[bool, str]:
+    """
+    Abre una pestaña de terminal remota en FyreWall para el PC indicado.
+    La pestaña se llama con la IP y permite ejecutar comandos via SMB + WMI.
+    """
+    if _FYREWALL_APP is not None:
+        try:
+            # Llamamos en el hilo principal de tkinter usando after()
+            _FYREWALL_APP.after(0, lambda: _FYREWALL_APP.open_remote_tab(
+                ip, _AULA_USER, _AULA_PASS
+            ))
+            return True, f"  ✅  Abriendo pestaña remota para {ip}..."
+        except Exception as e:
+            return False, f"  ❌  Error abriendo pestaña: {e}"
+    else:
+        return False, (
+            "  ❌  No se encontró la app FyreWall.\n"
+            "  Asegúrate de que ipmanager está cargado como plugin de FyreWall."
+        )
+
+
+def _enable_wmi_on_host(ip: str) -> tuple[bool, str]:
+    """
+    Habilita WMI en el firewall del host remoto.
+    Va despacio para no saturar el switch.
+    """
+    errors = []
+    # Construir comandos netsh sin f-strings con comillas anidadas
+    grp1 = "Instrumental de administracion de Windows"
+    grp2 = "Windows Management Instrumentation (WMI)"
+    netsh1 = 'netsh advfirewall firewall set rule group="' + grp1 + '" new enable=yes'
+    netsh2 = 'netsh advfirewall firewall set rule group="' + grp2 + '" new enable=yes'
+
+    # Método 1: WMI con PSCredential
+    ps1 = (
+        "$pw = ConvertTo-SecureString '" + _AULA_PASS + "' -AsPlainText -Force; "
+        "$cred = New-Object System.Management.Automation.PSCredential('" + _AULA_USER + "', $pw); "
+        "$wc = Get-WmiObject -Class Win32_Process -ComputerName " + ip + " -Credential $cred -List -ErrorAction Stop; "
+        "$wc.Create('" + netsh1 + "') | Out-Null; "
+        "$wc.Create('" + netsh2 + "') | Out-Null"
+    )
     try:
         r = subprocess.run(
-            ["shutdown", "/s", "/f", "/t", "0", "/m", f"\\\\{ip}"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_CF
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps1],
+            capture_output=True, text=True, timeout=5, creationflags=_CF
         )
         if r.returncode == 0:
-            return True, f"  ✅  Señal de apagado enviada a {ip}"
-        return False, (
-            f"  ❌  No se pudo apagar {ip}.\n"
-            f"  ℹ️  Requiere: admin en el host remoto + IPC$ compartido + misma red.\n"
-            f"  Salida: {(r.stderr or r.stdout).strip()}"
-        )
+            return True, "  \u2705  WMI habilitado en " + ip
+        errors.append("WMI directo \u2192 " + (r.stderr or r.stdout).strip()[:120])
+    except subprocess.TimeoutExpired:
+        errors.append("WMI directo \u2192 Timeout")
     except Exception as e:
-        return False, f"  ❌  Error: {e}"
+        errors.append("WMI directo \u2192 " + str(e))
+
+    # Método 2: net use IPC$ + wmiclass sin PSCredential
+    ps2 = (
+        "net use \\\\" + ip + "\\IPC$ '" + _AULA_PASS + "' /user:" + _AULA_USER + " 2>$null; "
+        "$wc = [wmiclass]'\\\\" + ip + "\\root\\cimv2:Win32_Process'; "
+        "$wc.Create('" + netsh1 + "') | Out-Null; "
+        "$wc.Create('" + netsh2 + "') | Out-Null; "
+        "net use \\\\" + ip + "\\IPC$ /delete /y 2>$null"
+    )
+    try:
+        r2 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps2],
+            capture_output=True, text=True, timeout=5, creationflags=_CF
+        )
+        if r2.returncode == 0:
+            return True, "  \u2705  WMI habilitado en " + ip + " (net use)"
+        errors.append("net use+WMI \u2192 " + (r2.stderr or r2.stdout).strip()[:120])
+    except subprocess.TimeoutExpired:
+        errors.append("net use+WMI \u2192 Timeout")
+    except Exception as e:
+        errors.append("net use+WMI \u2192 " + str(e))
+
+    err_lines = "\n".join("    \u2022 " + e for e in errors)
+    return False, "  \u274c  " + ip + " \u2192 no se pudo habilitar WMI:\n" + err_lines
+
+
+def _send_troll_message(ip: str, message: str) -> tuple[bool, str]:
+    """
+    Envía un popup a un PC remoto.
+    Primero establece conexión SMB (IPC$ via 445/139), luego ejecuta msg.exe.
+    """
+    errors = []
+    escaped_msg = message.replace('"', "'").replace("'", "\'")
+
+    # ── Paso 0: montar IPC$ via SMB (445/139) ────────────────────────────────
+    ipc_ok, ipc_msg = _mount_ipc(ip)
+    if ipc_ok:
+        # Con IPC$ montado, msg.exe puede llegar directamente
+        try:
+            r0 = subprocess.run(
+                ["msg", f"\\\\{ip}", "*", message],
+                capture_output=True, text=True, timeout=15, creationflags=_CF
+            )
+            if r0.returncode == 0:
+                _unmount_ipc(ip)
+                return True, f"  ✅  Mensaje enviado a {ip} (SMB/msg.exe)"
+            errors.append(f"SMB+msg.exe → {(r0.stderr or r0.stdout).strip()[:100]}")
+        except Exception as e:
+            errors.append(f"SMB+msg.exe → {e}")
+
+        # Con IPC$ montado, intentar WMI sin credenciales adicionales
+        ps_smb = (
+            f"$wc = [wmiclass]'\\\\" + ip + "\\\\root\\\\cimv2:Win32_Process'; "
+            f"$wc.Create('msg * {escaped_msg}') | Out-Null"
+        )
+        try:
+            r_smb = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_smb],
+                capture_output=True, text=True, timeout=15, creationflags=_CF
+            )
+            if r_smb.returncode == 0:
+                _unmount_ipc(ip)
+                return True, f"  ✅  Mensaje enviado a {ip} (SMB+WMI)"
+            errors.append(f"SMB+WMI → {(r_smb.stderr or r_smb.stdout).strip()[:100]}")
+        except Exception as e:
+            errors.append(f"SMB+WMI → {e}")
+        _unmount_ipc(ip)
+    else:
+        errors.append(f"SMB IPC$ → {ipc_msg.strip()}")
+
+    # ── Método 1: WMI Win32_Process → msg * (PowerShell nativo) ─────────────
+    ps1 = (
+        f"$pw = ConvertTo-SecureString '{_AULA_PASS}' -AsPlainText -Force; "
+        f"$cred = New-Object System.Management.Automation.PSCredential('{_AULA_USER}', $pw); "
+        f"$wmi = Get-WmiObject -Class Win32_Process -ComputerName {ip} -Credential $cred -List; "
+        f"$r = $wmi.Create('msg * {escaped_msg}'); "
+        f"exit $r.ReturnValue"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps1],
+            capture_output=True, text=True, timeout=20, creationflags=_CF
+        )
+        if r.returncode == 0:
+            return True, f"  ✅  Mensaje enviado a {ip}"
+        errors.append(f"WMI/msg → código {r.returncode}: {(r.stderr or r.stdout).strip()[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("WMI/msg → Timeout")
+    except Exception as e:
+        errors.append(f"WMI/msg → {e}")
+
+    # ── Método 2: Invoke-WmiMethod (sintaxis alternativa) ────────────────────
+    ps2 = (
+        f"$pw = ConvertTo-SecureString '{_AULA_PASS}' -AsPlainText -Force; "
+        f"$cred = New-Object System.Management.Automation.PSCredential('{_AULA_USER}', $pw); "
+        f"Invoke-WmiMethod -ComputerName {ip} -Credential $cred "
+        f"-Class Win32_Process -Name Create -ArgumentList 'msg * {escaped_msg}'"
+    )
+    try:
+        r2 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps2],
+            capture_output=True, text=True, timeout=20, creationflags=_CF
+        )
+        out2 = (r2.stdout or "").strip()
+        if r2.returncode == 0 and ("ReturnValue" not in out2 or "ReturnValue  : 0" in out2 or "ReturnValue : 0" in out2):
+            return True, f"  ✅  Mensaje enviado a {ip} (Invoke-WmiMethod)"
+        errors.append(f"Invoke-WmiMethod → {(r2.stderr or out2)[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("Invoke-WmiMethod → Timeout")
+    except Exception as e:
+        errors.append(f"Invoke-WmiMethod → {e}")
+
+    # ── Método 3: Invoke-Command / WinRM ─────────────────────────────────────
+    ps3 = (
+        f"$pw = ConvertTo-SecureString '{_AULA_PASS}' -AsPlainText -Force; "
+        f"$cred = New-Object System.Management.Automation.PSCredential('{_AULA_USER}', $pw); "
+        f"Invoke-Command -ComputerName {ip} -Credential $cred "
+        f"-ScriptBlock {{ msg * '{escaped_msg}' }}"
+    )
+    try:
+        r3 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps3],
+            capture_output=True, text=True, timeout=20, creationflags=_CF
+        )
+        if r3.returncode == 0:
+            return True, f"  ✅  Mensaje enviado a {ip} (WinRM)"
+        errors.append(f"WinRM → {(r3.stderr or r3.stdout).strip()[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("WinRM → Timeout")
+    except Exception as e:
+        errors.append(f"WinRM → {e}")
+
+    err_lines = "\n".join(f"       • {e}" for e in errors)
+    return False, (
+        f"  ⚠️  No se pudo enviar mensaje a {ip}.\n\n"
+        f"  Errores intentados:\n{err_lines}\n\n"
+        f"  ℹ️  El host remoto necesita tener WMI accesible en el firewall.\n"
+        f"  Ejecuta en el PC remoto (admin): netsh advfirewall firewall set rule "
+        f'group="Instrumental de administración de Windows" new enable=yes'
+    )
+
+
+def _shutdown_device(ip: str) -> tuple[bool, str]:
+    """
+    Apaga un PC remoto.
+    Primero establece conexión SMB (IPC$ via 445/139), luego ejecuta shutdown.
+    """
+    errors = []
+
+    # ── Paso 0: montar IPC$ via SMB (445/139) ────────────────────────────────
+    ipc_ok, ipc_msg = _mount_ipc(ip)
+    if ipc_ok:
+        # Con IPC$ montado, shutdown /m funciona directamente
+        try:
+            r0 = subprocess.run(
+                ["shutdown", "/s", "/f", "/t", "0", "/m", f"\\\\{ip}"],
+                capture_output=True, text=True, timeout=15, creationflags=_CF
+            )
+            _unmount_ipc(ip)
+            if r0.returncode == 0:
+                return True, f"  ✅  Apagado enviado a {ip} (SMB + shutdown.exe)"
+            errors.append(f"SMB+shutdown.exe → {(r0.stderr or r0.stdout).strip()[:100]}")
+        except Exception as e:
+            errors.append(f"SMB+shutdown.exe → {e}")
+            _unmount_ipc(ip)
+    else:
+        errors.append(f"SMB IPC$ → {ipc_msg.strip()}")
+    ps1 = (
+        f"$pw = ConvertTo-SecureString '{_AULA_PASS}' -AsPlainText -Force; "
+        f"$cred = New-Object System.Management.Automation.PSCredential('{_AULA_USER}', $pw); "
+        f"$os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName {ip} -Credential $cred; "
+        f"$r = $os.Win32Shutdown(5); exit $r.ReturnValue"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps1],
+            capture_output=True, text=True, timeout=20, creationflags=_CF
+        )
+        if r.returncode == 0:
+            return True, f"  ✅  Apagado enviado a {ip} (WMI Win32Shutdown)"
+        errors.append(f"WMI Win32Shutdown → código {r.returncode}: {(r.stderr or r.stdout).strip()[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("WMI Win32Shutdown → Timeout")
+    except Exception as e:
+        errors.append(f"WMI Win32Shutdown → {e}")
+
+    # ── Método 2: Invoke-Command / WinRM → Stop-Computer ────────────────────
+    ps2 = (
+        f"$pw = ConvertTo-SecureString '{_AULA_PASS}' -AsPlainText -Force; "
+        f"$cred = New-Object System.Management.Automation.PSCredential('{_AULA_USER}', $pw); "
+        f"Invoke-Command -ComputerName {ip} -Credential $cred "
+        f"-ScriptBlock {{ Stop-Computer -Force }}"
+    )
+    try:
+        r2 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps2],
+            capture_output=True, text=True, timeout=25, creationflags=_CF
+        )
+        if r2.returncode == 0:
+            return True, f"  ✅  Apagado enviado a {ip} (WinRM Stop-Computer)"
+        errors.append(f"WinRM Stop-Computer → {(r2.stderr or r2.stdout).strip()[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("WinRM Stop-Computer → Timeout")
+    except Exception as e:
+        errors.append(f"WinRM Stop-Computer → {e}")
+
+    # ── Método 3: shutdown.exe /m con credenciales vía runas ─────────────────
+    # Montar IPC$ para autenticarse y luego lanzar shutdown
+    ps3 = (
+        f"net use \\\\{ip}\\IPC$ '{_AULA_PASS}' /user:{_AULA_USER} 2>$null; "
+        f"shutdown /s /f /t 0 /m \\\\{ip}; "
+        f"net use \\\\{ip}\\IPC$ /delete /y 2>$null"
+    )
+    try:
+        r3 = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps3],
+            capture_output=True, text=True, timeout=20, creationflags=_CF
+        )
+        if r3.returncode == 0:
+            return True, f"  ✅  Apagado enviado a {ip} (net use + shutdown)"
+        errors.append(f"net use+shutdown → {(r3.stderr or r3.stdout).strip()[:100]}")
+    except subprocess.TimeoutExpired:
+        errors.append("net use+shutdown → Timeout")
+    except Exception as e:
+        errors.append(f"net use+shutdown → {e}")
+
+    err_lines = "\n".join(f"       • {e}" for e in errors)
+    return False, (
+        f"  ❌  No se pudo apagar {ip}.\n\n"
+        f"  Errores intentados:\n{err_lines}\n\n"
+        f"  ℹ️  El host remoto necesita tener WMI accesible en el firewall.\n"
+        f"  Ejecuta en el PC remoto (admin): netsh advfirewall firewall set rule "
+        f'group="Instrumental de administración de Windows" new enable=yes'
+    )
+
 
 # ─── IP COMMAND HELP ─────────────────────────────────────────────────────────
 
@@ -363,15 +699,40 @@ _IP_HELP = """\
 
   ACCIONES DE RED LOCAL
   ─────────────────────────────────────────────────────────────
+  ip admin-pc <ip>
+      Abre una consola remota interactiva en el PC indicado.
+      Usa SMB (445/139) para autenticarse y luego PSSession.
+      Ej: ip admin-pc 192.168.1.50
+
   ip troll <ip> <mensaje>
       Envía un mensaje de alerta emergente (popup) a un
-      dispositivo de la red local.
+      dispositivo de la red local. Usa SMB (445/139) primero.
       Ej: ip troll 192.168.1.50 Hola desde FyreWall!
 
   ip shutdown <ip>
       Envía señal de apagado a un dispositivo de la red
-      local (requiere admin en el dispositivo remoto).
+      local. Usa SMB (445/139) + shutdown.exe directamente.
       Ej: ip shutdown 192.168.1.50
+
+  SETUP
+  ─────────────────────────────────────────────────────────────
+  ip setup-aula
+      Habilita WMI en todos los PCs del aula de una vez.
+      Solo necesario la primera vez.
+
+  ip setup-pc <ip>
+      Habilita WMI en un PC concreto.
+      Ej: ip setup-pc 192.168.11.15
+
+  CREDENCIALES (para PsExec / WinRM en red de aula)
+  ─────────────────────────────────────────────────────────────
+  ip setcreds <usuario> <contraseña>
+      Guarda credenciales admin para usar con shutdown y troll.
+      Solo necesitas hacerlo una vez.
+      Ej: ip setcreds Administrador MiClave123
+
+  ip clearcreds
+      Elimina las credenciales guardadas.
 
   GENERAL
   ─────────────────────────────────────────────────────────────
@@ -501,6 +862,18 @@ def handle_ip_command(args: list[str]) -> tuple[str, str]:
         lines.append(f"\n  ✅  Proceso completado. {len(targets)} IP(s) procesada(s).")
         return "\n".join(lines), "ok"
 
+    # ── ip admin-pc <ip> ─────────────────────────────────────────────────────
+    if sub == "admin-pc":
+        if len(args) < 2:
+            return (
+                "  Uso: ip admin-pc <ip>\n"
+                "  Ej:  ip admin-pc 192.168.1.50\n"
+                "  Abre una consola remota interactiva en el PC indicado.", "warn"
+            )
+        ip = args[1]
+        ok, result = _connect_admin_console(ip)
+        return f"  🖥️   IpManager — Consola remota en {ip}\n\n{result}", "ok" if ok else "warn"
+
     # ── ip troll <ip> <mensaje> ───────────────────────────────────────────────
     if sub == "troll":
         if len(args) < 3:
@@ -524,6 +897,89 @@ def handle_ip_command(args: list[str]) -> tuple[str, str]:
         ip = args[1]
         ok, result = _shutdown_device(ip)
         return f"  💤  IpManager — Apagado remoto\n\n{result}", "ok" if ok else "warn"
+
+    # ── ip setup-aula ────────────────────────────────────────────────────────
+    if sub in ("setup-aula", "setup"):
+        hosts = _scan_local_network()
+        my_ips = set(_get_local_ips())
+        targets = [h for h in hosts if h not in my_ips]
+
+        if not targets:
+            return "  ℹ️  No se encontraron hosts en la red local.", "warn"
+
+        lines = [
+            "╔══════════════════════════════════════════════════════════════╗",
+            "║         IpManager — Habilitando WMI en el aula               ║",
+            "╚══════════════════════════════════════════════════════════════╝",
+            f"",
+            f"  Hosts encontrados: {len(targets)}",
+            f"  (Cadencia lenta para no saturar el switch)",
+            "",
+        ]
+
+        ok_count  = 0
+        err_count = 0
+        # Procesar de uno en uno con pausa entre cada host
+        for i, ip in enumerate(targets, 1):
+            ok, msg = _enable_wmi_on_host(ip)
+            lines.append(f"  [{i:>2}/{len(targets)}] {msg.strip()}")
+            if ok:
+                ok_count += 1
+            else:
+                err_count += 1
+
+        lines.append("")
+        lines.append(f"  ✅  OK: {ok_count}   ❌  Error: {err_count}")
+        lines.append("  💡  Ahora prueba 'ip shutdown <ip>' o 'ip troll <ip> <msg>'")
+        return "\n".join(lines), "ok" if ok_count > 0 else "warn"
+
+    # ── ip setup-pc <ip> ─────────────────────────────────────────────────────
+    if sub == "setup-pc":
+        if len(args) < 2:
+            return (
+                "  Uso: ip setup-pc <ip>\n"
+                "  Ej:  ip setup-pc 192.168.11.15\n"
+                "  Habilita WMI en ese PC para poder usar shutdown y troll.", "warn"
+            )
+        ip = args[1]
+        ok, msg = _enable_wmi_on_host(ip)
+        status = "ok" if ok else "warn"
+        return (
+            f"  🔧  IpManager — Setup WMI en {ip}\n\n"
+            f"{msg}\n\n"
+            + ("  💡  Ahora puedes usar 'ip shutdown' e 'ip troll' en este PC." if ok
+               else "  ℹ️  Comprueba que el PC esté encendido y en la misma red."),
+            status
+        )
+
+    # ── ip setcreds <usuario> <contraseña> ──────────────────────────────────
+    if sub == "setcreds":
+        if len(args) < 3:
+            return (
+                "  Uso: ip setcreds <usuario> <contraseña>\n"
+                "  Ej:  ip setcreds Administrador MiClave123\n"
+                "  Las credenciales se guardan localmente para PsExec/WinRM.", "warn"
+            )
+        _user = args[1]
+        _pass = " ".join(args[2:])
+        state = _read_state()
+        state["creds_user"] = _user
+        state["creds_pass"] = _pass
+        _write_state(state)
+        return (
+            f"  ✅  Credenciales guardadas.\n"
+            f"  Usuario: {_user}\n"
+            f"  Los comandos 'ip shutdown' e 'ip troll' las usarán automáticamente.\n"
+            f"  ⚠️  Se guardan en texto plano en .ipmanager_state.json", "ok"
+        )
+
+    # ── ip clearcreds ─────────────────────────────────────────────────────────
+    if sub == "clearcreds":
+        state = _read_state()
+        state.pop("creds_user", None)
+        state.pop("creds_pass", None)
+        _write_state(state)
+        return "  ✅  Credenciales eliminadas.", "ok"
 
     return (
         f"  ❌  Subcomando desconocido: 'ip {sub}'\n"
@@ -627,6 +1083,7 @@ def _run_installer():
         ("ip block <ip>",          "Bloquea una dirección IP"),
         ("ip unblock <ip>",        "Desbloquea una dirección IP"),
         ("ip blockall [-exc]",     "Bloquea todas las IPs (con exclusiones)"),
+        ("ip admin-pc <ip>",       "Consola remota interactiva en un PC del aula"),
         ("ip troll <ip> <msg>",    "Envía popup de texto a un dispositivo local"),
         ("ip shutdown <ip>",       "Apaga un dispositivo de la red local"),
     ]
