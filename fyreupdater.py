@@ -3,7 +3,25 @@ FyreUpdater — Plugin de actualización para FyreWall
 =====================================================
 Comprueba y descarga actualizaciones desde GitHub para:
   - fyrewall.py        (repo principal: luckicla/FyreWall)
+  - fyreupdater.py     (este mismo archivo — auto-actualizable)
   - add-ons instalados (repo add-ons:   luckicla/FyreWall-add-ons)
+
+La lista de add-ons es dinámica: se lee desde
+  https://raw.githubusercontent.com/luckicla/FyreWall-add-ons/main/manifest.json
+
+Formato esperado de manifest.json en el repo de add-ons:
+  {
+    "addons": [
+      {
+        "file":        "dayus.py",
+        "name":        "Dayus",
+        "description": "Descripción del add-on",
+        "author":      "Autor",
+        "version":     "1.2.0"
+      },
+      ...
+    ]
+  }
 
 Integración en FyreManager:
   - Botón azul "🔄 Actualizar" en la UI del gestor (a la izquierda del rojo)
@@ -27,7 +45,7 @@ import hashlib
 
 FYRE_MANIFEST = {
     "name":        "FyreUpdater",
-    "version":     "1.0.0",
+    "version":     "1.1.0",
     "author":      "FyreWall",
     "description": "Actualiza FyreWall y sus add-ons desde GitHub",
     "commands": [
@@ -42,16 +60,18 @@ FYRE_MANIFEST = {
 
 # ── GitHub config ─────────────────────────────────────────────────────────────
 
-GITHUB_API   = "https://api.github.com"
-RAW_BASE     = "https://raw.githubusercontent.com"
+GITHUB_API    = "https://api.github.com"
+RAW_BASE      = "https://raw.githubusercontent.com"
 
-MAIN_REPO    = "luckicla/FyreWall"
-ADDONS_REPO  = "luckicla/FyreWall-add-ons"
+MAIN_REPO     = "luckicla/FyreWall"
+ADDONS_REPO   = "luckicla/FyreWall-add-ons"
+UPDATER_REPO  = "luckicla/FyreWall"          # fyreupdater.py vive en el repo principal
 
-MAIN_FILE    = "fyrewall.py"
-ADDONS_FILES = ["dayus.py", "ipmanager.py", "tabshortcuts.py"]
+MAIN_FILE     = "fyrewall.py"
+UPDATER_FILE  = "fyreupdater.py"             # este mismo archivo
+ADDONS_MANIFEST_FILE = "manifest.json"       # manifest dinámico en el repo de add-ons
 
-APP_DIR      = os.path.dirname(os.path.abspath(sys.argv[0]))
+APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 
 # ── Colors (mirror fyrewall.py theme) ─────────────────────────────────────────
 
@@ -95,8 +115,10 @@ def _set_app(app):
 def _api_get(path: str) -> dict | list | None:
     """GET from GitHub API. Returns parsed JSON or None on error."""
     url = f"{GITHUB_API}/{path}"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json",
-                                                "User-Agent": "FyreUpdater/1.0"})
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "FyreUpdater/1.1",
+    })
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode())
@@ -107,7 +129,7 @@ def _api_get(path: str) -> dict | list | None:
 def _raw_get(repo: str, branch: str, filepath: str) -> bytes | None:
     """Download raw file from GitHub."""
     url = f"{RAW_BASE}/{repo}/{branch}/{filepath}"
-    req = urllib.request.Request(url, headers={"User-Agent": "FyreUpdater/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "FyreUpdater/1.1"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.read()
@@ -127,69 +149,81 @@ def _local_sha256(path: str) -> str | None:
         return None
 
 
-def _get_remote_sha(repo: str, branch: str, filepath: str) -> str | None:
-    """Get SHA-256 of the remote file (by downloading it)."""
-    data = _raw_get(repo, branch, filepath)
+# ── Dynamic add-ons manifest ──────────────────────────────────────────────────
+
+def fetch_addons_manifest() -> list[dict]:
+    """
+    Fetches manifest.json from the add-ons repo.
+    Returns a list of addon dicts:
+      [{"file": "dayus.py", "name": "Dayus", "description": "...", ...}, ...]
+    Falls back to empty list on error.
+    """
+    data = _raw_get(ADDONS_REPO, "main", ADDONS_MANIFEST_FILE)
     if data is None:
-        return None
-    return _sha256(data)
+        return []
+    try:
+        manifest = json.loads(data.decode())
+        addons = manifest.get("addons", [])
+        # Ensure each entry has at least a "file" key
+        return [a for a in addons if isinstance(a, dict) and "file" in a]
+    except Exception:
+        return []
 
 
 # ── Update check ──────────────────────────────────────────────────────────────
 
-def check_all_updates() -> dict:
+def _check_file(repo: str, branch: str, fname: str, is_addon: bool = False) -> dict:
+    """
+    Check a single file and return its status dict.
+    """
+    local_path   = os.path.join(APP_DIR, fname)
+    local_exists = os.path.exists(local_path)
+    local_sha    = _local_sha256(local_path) if local_exists else None
+    remote_data  = _raw_get(repo, branch, fname)
+
+    base = {"repo": repo, "branch": branch, "file": fname,
+            "local_exists": local_exists, "local_sha": local_sha}
+
+    if remote_data is None:
+        return {**base, "status": "error", "remote_sha": None}
+
+    remote_sha = _sha256(remote_data)
+
+    if not local_exists:
+        status = "missing"
+    elif local_sha == remote_sha:
+        status = "ok"
+    else:
+        status = "update"
+
+    return {**base, "status": status, "remote_sha": remote_sha, "_data": remote_data}
+
+
+def check_all_updates(addons_manifest: list[dict]) -> dict:
     """
     Returns a dict with update status for all tracked files.
-    {
-      "fyrewall.py": {"status": "update"|"ok"|"error", "remote_sha": ..., "local_sha": ...},
-      "dayus.py":    {"status": "update"|"ok"|"missing"|"error", ...},
-      ...
-    }
+    Keys: filename → status dict.
+
+    Sections:
+      - "fyrewall.py"    (main app)
+      - "fyreupdater.py" (self)
+      - one entry per addon in addons_manifest
     """
     results = {}
 
-    # ── Main app ─────────────────────────────────────────────────────────
-    local_path = os.path.join(APP_DIR, MAIN_FILE)
-    local_sha  = _local_sha256(local_path)
-    remote_data = _raw_get(MAIN_REPO, "main", MAIN_FILE)
-    if remote_data is None:
-        results[MAIN_FILE] = {"status": "error", "local_sha": local_sha, "remote_sha": None,
-                               "repo": MAIN_REPO, "branch": "main", "file": MAIN_FILE}
-    else:
-        remote_sha = _sha256(remote_data)
-        if local_sha == remote_sha:
-            results[MAIN_FILE] = {"status": "ok", "local_sha": local_sha, "remote_sha": remote_sha,
-                                   "repo": MAIN_REPO, "branch": "main", "file": MAIN_FILE,
-                                   "_data": remote_data}
-        else:
-            results[MAIN_FILE] = {"status": "update", "local_sha": local_sha, "remote_sha": remote_sha,
-                                   "repo": MAIN_REPO, "branch": "main", "file": MAIN_FILE,
-                                   "_data": remote_data}
+    # ── Main app ──────────────────────────────────────────────────────────
+    results[MAIN_FILE] = _check_file(MAIN_REPO, "main", MAIN_FILE)
 
-    # ── Add-ons ──────────────────────────────────────────────────────────
-    for fname in ADDONS_FILES:
-        local_path = os.path.join(APP_DIR, fname)
-        local_exists = os.path.exists(local_path)
-        local_sha = _local_sha256(local_path) if local_exists else None
-        remote_data = _raw_get(ADDONS_REPO, "main", fname)
-        if remote_data is None:
-            results[fname] = {"status": "error", "local_sha": local_sha, "remote_sha": None,
-                               "local_exists": local_exists, "repo": ADDONS_REPO,
-                               "branch": "main", "file": fname}
-            continue
-        remote_sha = _sha256(remote_data)
-        if not local_exists:
-            results[fname] = {"status": "missing", "local_sha": None, "remote_sha": remote_sha,
-                               "local_exists": False, "repo": ADDONS_REPO,
-                               "branch": "main", "file": fname, "_data": remote_data}
-        elif local_sha == remote_sha:
-            results[fname] = {"status": "ok", "local_sha": local_sha, "remote_sha": remote_sha,
-                               "local_exists": True, "repo": ADDONS_REPO,
-                               "branch": "main", "file": fname, "_data": remote_data}
-        else:
-            results[fname] = {"status": "update", "local_sha": local_sha, "remote_sha": remote_sha,
-                               "local_exists": True, "repo": ADDONS_REPO,
-                               "branch": "main", "file": fname, "_data": remote_data}
+    # ── FyreUpdater (self) ────────────────────────────────────────────────
+    results[UPDATER_FILE] = _check_file(UPDATER_REPO, "main", UPDATER_FILE)
+    results[UPDATER_FILE]["is_self"] = True   # flag for restart warning
+
+    # ── Add-ons (dynamic) ─────────────────────────────────────────────────
+    for addon in addons_manifest:
+        fname = addon["file"]
+        info  = _check_file(ADDONS_REPO, "main", fname, is_addon=True)
+        info["addon_meta"] = addon           # name, description, author, version
+        results[fname] = info
 
     return results
 
@@ -198,13 +232,13 @@ def apply_update(info: dict) -> tuple[bool, str]:
     """Download and overwrite the file. Returns (ok, message)."""
     data = info.get("_data")
     if data is None:
-        # Re-download
         data = _raw_get(info["repo"], info["branch"], info["file"])
     if data is None:
         return False, f"No se pudo descargar {info['file']}"
+
     dest = os.path.join(APP_DIR, info["file"])
-    # Backup
-    bak = dest + ".bak"
+    bak  = dest + ".bak"
+
     if os.path.exists(dest):
         try:
             shutil.copy2(dest, bak)
@@ -215,7 +249,6 @@ def apply_update(info: dict) -> tuple[bool, str]:
             f.write(data)
         return True, f"✅ {info['file']} actualizado correctamente."
     except Exception as e:
-        # Restore backup
         if os.path.exists(bak):
             shutil.copy2(bak, dest)
         return False, f"❌ Error al escribir {info['file']}: {e}"
@@ -224,11 +257,11 @@ def apply_update(info: dict) -> tuple[bool, str]:
 # ── Installer / Updater Tab ───────────────────────────────────────────────────
 
 class UpdaterTab(tk.Frame):
-    """Pestaña 'Instalador' completa con comprobación y aplicación de updates."""
+    """Pestaña 'Instalador' con manifest dinámico y auto-actualización."""
 
     STATUS_ICONS = {
         "ok":      ("✅", C["ok"]),
-        "update":  ("⬆️", C["warn"]),
+        "update":  ("⬆️",  C["warn"]),
         "missing": ("📥", C["accent"]),
         "error":   ("❌", C["danger"]),
         "loading": ("⏳", C["muted"]),
@@ -236,16 +269,17 @@ class UpdaterTab(tk.Frame):
 
     def __init__(self, parent, app_ref=None):
         super().__init__(parent, bg=C["bg"])
-        self._app = app_ref or _app_ref
-        self._check_results: dict = {}
-        self._row_widgets: dict = {}   # fname → dict of label refs
-        self._checking = False
-        self._build()
-        self.after(300, self._do_check)   # auto-check on open
+        self._app             = app_ref or _app_ref
+        self._check_results:  dict       = {}
+        self._addons_manifest: list[dict] = []
+        self._row_widgets:    dict       = {}
+        self._checking        = False
+        self._build_skeleton()
+        self.after(300, self._do_check)
 
-    # ── Build UI ──────────────────────────────────────────────────────────
+    # ── Build skeleton UI (before check) ─────────────────────────────────
 
-    def _build(self):
+    def _build_skeleton(self):
         # ── Header ────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=C["surface"], pady=10, padx=16)
         hdr.pack(fill="x")
@@ -255,67 +289,65 @@ class UpdaterTab(tk.Frame):
         tk.Label(hdr, text="  —  Actualiza FyreWall y sus add-ons desde GitHub",
                  font=F_BODY, bg=C["surface"], fg=C["muted"]).pack(side="left")
 
-        # Right: reload button
         self._reload_btn = tk.Button(
             hdr, text="↺  Recargar",
             command=self._do_check,
             bg=C["btn"], fg=C["muted"],
             font=F_BODY, relief="flat", cursor="hand2",
-            padx=10, pady=4,
-            activebackground=C["btn_h"],
+            padx=10, pady=4, activebackground=C["btn_h"],
         )
         self._reload_btn.pack(side="right")
 
-        # ── Status banner (updates available / all ok) ─────────────────
+        # ── Status banner ─────────────────────────────────────────────────
         self._banner_frame = tk.Frame(self, bg=C["warn"], pady=0)
-        # Hidden initially, shown after check
-
         self._banner_lbl = tk.Label(
-            self._banner_frame,
-            text="",
-            font=F_BOLD, bg=C["warn"], fg="#000000",
-            padx=16, pady=8,
+            self._banner_frame, text="",
+            font=F_BOLD, bg=C["warn"], fg="#000000", padx=16, pady=8,
         )
         self._banner_lbl.pack(side="left")
-
         self._update_all_btn = tk.Button(
-            self._banner_frame,
-            text="⬆️  Actualizar todo",
+            self._banner_frame, text="⬆️  Actualizar todo",
             command=self._update_all,
             bg="#7a5000", fg="#ffffff",
             font=F_BOLD, relief="flat", cursor="hand2",
-            padx=12, pady=6,
-            activebackground="#9a6500",
+            padx=12, pady=6, activebackground="#9a6500",
         )
         self._update_all_btn.pack(side="right", padx=12, pady=4)
 
-        # ── Content: two sections ─────────────────────────────────────────
+        # ── Scrollable content area ───────────────────────────────────────
         scroll_outer = tk.Frame(self, bg=C["bg"])
         scroll_outer.pack(fill="both", expand=True)
 
-        canvas = tk.Canvas(scroll_outer, bg=C["bg"], highlightthickness=0)
-        vsb = ttk.Scrollbar(scroll_outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
+        self._canvas = tk.Canvas(scroll_outer, bg=C["bg"], highlightthickness=0)
+        vsb = ttk.Scrollbar(scroll_outer, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
+        self._canvas.pack(side="left", fill="both", expand=True)
 
-        self._inner = tk.Frame(canvas, bg=C["bg"])
-        win_id = canvas.create_window((0, 0), window=self._inner, anchor="nw")
-        self._inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
-        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units"))
+        self._inner = tk.Frame(self._canvas, bg=C["bg"])
+        win_id = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>",
+                         lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(win_id, width=e.width))
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1 * int(e.delta / 120), "units"))
 
-        # Section: Main app
-        self._build_section("🔥  FYREWALL PRINCIPAL", [MAIN_FILE], "main")
-        # Separator
-        tk.Frame(self._inner, bg=C["border"], height=1).pack(fill="x", padx=20, pady=8)
-        # Section: Add-ons
-        self._build_section("📦  ADD-ONS", ADDONS_FILES, "addons")
+        # placeholder while loading
+        self._placeholder = tk.Label(
+            self._inner, text="⏳  Obteniendo manifest de add-ons desde GitHub...",
+            font=F_BODY, bg=C["bg"], fg=C["muted"], pady=30,
+        )
+        self._placeholder.pack()
 
-        # ── Log area ──────────────────────────────────────────────────────
+        # ── Log ───────────────────────────────────────────────────────────
+        self._build_log()
+
+    def _build_log(self):
         log_hdr = tk.Frame(self._inner, bg=C["surface"], pady=6, padx=12)
         log_hdr.pack(fill="x", padx=20, pady=(16, 0))
-        tk.Label(log_hdr, text="REGISTRO", font=F_LBL, bg=C["surface"], fg=C["accent"]).pack(side="left")
+        tk.Label(log_hdr, text="REGISTRO", font=F_LBL,
+                 bg=C["surface"], fg=C["accent"]).pack(side="left")
         tk.Button(log_hdr, text="🗑 Limpiar",
                   command=self._clear_log,
                   bg=C["btn"], fg=C["muted"],
@@ -336,24 +368,78 @@ class UpdaterTab(tk.Frame):
         log_sb.pack(side="right", fill="y")
         self._log.pack(side="left", fill="both", expand=True)
 
-        for tag, color in [("ok", C["ok"]), ("warn", C["warn"]), ("err", C["danger"]),
-                            ("info", C["console_text"]), ("muted", C["muted"]),
-                            ("header", C["accent"])]:
+        for tag, color in [
+            ("ok",     C["ok"]),
+            ("warn",   C["warn"]),
+            ("err",    C["danger"]),
+            ("info",   C["console_text"]),
+            ("muted",  C["muted"]),
+            ("header", C["accent"]),
+        ]:
             self._log.tag_configure(tag, foreground=color)
 
-    def _build_section(self, title: str, files: list, section_key: str):
+    # ── Build dynamic rows after manifest is fetched ───────────────────────
+
+    def _rebuild_rows(self):
+        """Destroy old rows and rebuild based on current manifest."""
+        # Keep log widget references before destroying inner children
+        for widget in self._inner.winfo_children():
+            widget.destroy()
+        self._row_widgets = {}
+
+        # ── Section: FyreWall principal ───────────────────────────────────
+        self._build_section(
+            "🔥  FYREWALL PRINCIPAL",
+            [{"file": MAIN_FILE, "name": "FyreWall", "description": "Aplicación principal"}],
+            show_meta=False,
+        )
+
+        # ── Section: FyreUpdater (self) ───────────────────────────────────
+        tk.Frame(self._inner, bg=C["border"], height=1).pack(fill="x", padx=20, pady=8)
+        self._build_section(
+            "🔄  FYREUPDATER (este plugin)",
+            [{"file": UPDATER_FILE, "name": "FyreUpdater",
+              "description": "Plugin de actualización — se actualiza a sí mismo"}],
+            show_meta=False,
+        )
+
+        # ── Section: Add-ons ──────────────────────────────────────────────
+        tk.Frame(self._inner, bg=C["border"], height=1).pack(fill="x", padx=20, pady=8)
+        if self._addons_manifest:
+            self._build_section(
+                f"📦  ADD-ONS  ({len(self._addons_manifest)} disponibles)",
+                self._addons_manifest,
+                show_meta=True,
+            )
+        else:
+            no_addons = tk.Frame(self._inner, bg=C["bg"], padx=20, pady=10)
+            no_addons.pack(fill="x")
+            hdr = tk.Frame(no_addons, bg=C["surface"], pady=8, padx=12)
+            hdr.pack(fill="x")
+            tk.Label(hdr, text="📦  ADD-ONS", font=F_LBL,
+                     bg=C["surface"], fg=C["accent"]).pack(side="left")
+            tk.Label(no_addons,
+                     text="⚠️  No se pudo obtener el manifest de add-ons (sin red o repo no disponible).",
+                     font=F_BODY, bg=C["bg"], fg=C["warn"], pady=8).pack(anchor="w")
+
+        # ── Rebuild log ───────────────────────────────────────────────────
+        self._build_log()
+
+    def _build_section(self, title: str, items: list[dict], show_meta: bool = True):
         sec = tk.Frame(self._inner, bg=C["bg"], padx=20, pady=10)
         sec.pack(fill="x")
 
         hdr = tk.Frame(sec, bg=C["surface"], pady=8, padx=12)
         hdr.pack(fill="x")
-        tk.Label(hdr, text=title, font=F_LBL, bg=C["surface"], fg=C["accent"]).pack(side="left")
+        tk.Label(hdr, text=title, font=F_LBL,
+                 bg=C["surface"], fg=C["accent"]).pack(side="left")
 
-        for fname in files:
-            self._build_file_row(sec, fname)
+        for item in items:
+            self._build_file_row(sec, item, show_meta=show_meta)
 
-    def _build_file_row(self, parent, fname: str):
-        row = tk.Frame(parent, bg=C["surface2"], pady=0)
+    def _build_file_row(self, parent, item: dict, show_meta: bool = True):
+        fname = item["file"]
+        row   = tk.Frame(parent, bg=C["surface2"], pady=0)
         row.pack(fill="x", pady=(1, 0))
 
         inner = tk.Frame(row, bg=C["surface2"], padx=12, pady=10)
@@ -364,20 +450,29 @@ class UpdaterTab(tk.Frame):
                              bg=C["surface2"], fg=C["muted"])
         icon_lbl.pack(side="left", padx=(0, 10))
 
-        # File info
+        # File info column
         info_col = tk.Frame(inner, bg=C["surface2"])
         info_col.pack(side="left", fill="x", expand=True)
 
-        name_lbl = tk.Label(info_col, text=fname, font=F_BOLD,
+        # Filename + optional addon name
+        name_text = fname
+        if show_meta and item.get("name") and item["name"] != fname:
+            name_text = f"{item['name']}  ({fname})"
+        name_lbl = tk.Label(info_col, text=name_text, font=F_BOLD,
                              bg=C["surface2"], fg=C["text"])
         name_lbl.pack(anchor="w")
+
+        # Description (only for addons)
+        if show_meta and item.get("description"):
+            tk.Label(info_col, text=item["description"], font=F_BODY,
+                     bg=C["surface2"], fg=C["muted"]).pack(anchor="w")
 
         status_lbl = tk.Label(info_col, text="Comprobando...", font=F_BODY,
                                bg=C["surface2"], fg=C["muted"])
         status_lbl.pack(anchor="w")
 
         sha_lbl = tk.Label(info_col, text="", font=F_MONO,
-                            bg=C["surface2"], fg=C["muted"])
+                           bg=C["surface2"], fg=C["muted"])
         sha_lbl.pack(anchor="w")
 
         # Action buttons
@@ -391,7 +486,6 @@ class UpdaterTab(tk.Frame):
             font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
             padx=8, pady=4, activebackground=C["blue_act"],
         )
-        # Hidden by default, shown when needed
         install_btn.pack_forget()
 
         update_btn = tk.Button(
@@ -413,40 +507,39 @@ class UpdaterTab(tk.Frame):
             "inner":      inner,
         }
 
-    # ── Check ─────────────────────────────────────────────────────────────
+    # ── Check flow ────────────────────────────────────────────────────────
 
     def _do_check(self):
         if self._checking:
             return
         self._checking = True
         self._reload_btn.config(state="disabled", text="⏳ Comprobando...")
-        self._log_write("🔍  Comprobando actualizaciones desde GitHub...", "header")
-
-        # Reset all rows to loading state
-        for fname, widgets in self._row_widgets.items():
-            icon, color = self.STATUS_ICONS["loading"]
-            widgets["icon"].config(text=icon, fg=color)
-            widgets["status_lbl"].config(text="Comprobando...", fg=C["muted"])
-            widgets["sha_lbl"].config(text="")
-            widgets["install"].pack_forget()
-            widgets["update"].pack_forget()
-
+        self._log_write("🔍  Obteniendo manifest y comprobando actualizaciones...", "header")
         threading.Thread(target=self._check_thread, daemon=True).start()
 
     def _check_thread(self):
-        results = check_all_updates()
-        self.after(0, lambda r=results: self._render_check(r))
+        # Step 1: fetch dynamic manifest
+        manifest = fetch_addons_manifest()
+        # Step 2: check all files
+        results  = check_all_updates(manifest)
+        self.after(0, lambda m=manifest, r=results: self._on_check_done(m, r))
 
-    def _render_check(self, results: dict):
-        self._check_results = results
-        self._checking = False
+    def _on_check_done(self, manifest: list[dict], results: dict):
+        self._addons_manifest = manifest
+        self._check_results   = results
+        self._checking        = False
         self._reload_btn.config(state="normal", text="↺  Recargar")
 
+        # Rebuild rows to match manifest (handles added/removed add-ons)
+        self._rebuild_rows()
+        self._render_results(results)
+
+    def _render_results(self, results: dict):
         updates = 0
         missing = 0
 
         for fname, info in results.items():
-            status = info["status"]
+            status  = info["status"]
             widgets = self._row_widgets.get(fname)
             if not widgets:
                 continue
@@ -459,14 +552,18 @@ class UpdaterTab(tk.Frame):
             lsha = (info.get("local_sha") or "—")[:12]
             rsha = (info.get("remote_sha") or "—")[:12]
 
+            is_self = info.get("is_self", False)
+
             if status == "ok":
                 widgets["status_lbl"].config(text="Al día", fg=C["ok"])
                 widgets["sha_lbl"].config(text=f"SHA: {lsha}", fg=C["muted"])
                 self._log_write(f"  ✅ {fname} — sin cambios.", "ok")
 
             elif status == "update":
-                widgets["status_lbl"].config(
-                    text="⚠️  Actualización disponible", fg=C["warn"])
+                label = "⚠️  Actualización disponible"
+                if is_self:
+                    label += "  (requiere reinicio)"
+                widgets["status_lbl"].config(text=label, fg=C["warn"])
                 widgets["sha_lbl"].config(
                     text=f"Local: {lsha}  →  Remoto: {rsha}", fg=C["warn"])
                 widgets["update"].pack(side="left", padx=(0, 4))
@@ -475,7 +572,7 @@ class UpdaterTab(tk.Frame):
 
             elif status == "missing":
                 widgets["status_lbl"].config(
-                    text="📥 Add-on no instalado (disponible en GitHub)", fg=C["accent"])
+                    text="📥 No instalado (disponible en GitHub)", fg=C["accent"])
                 widgets["sha_lbl"].config(text=f"Remoto: {rsha}", fg=C["muted"])
                 widgets["install"].pack(side="left", padx=(0, 4))
                 self._log_write(f"  📥 {fname} — no instalado, disponible.", "info")
@@ -483,31 +580,29 @@ class UpdaterTab(tk.Frame):
 
             elif status == "error":
                 widgets["status_lbl"].config(text="❌ Error al comprobar", fg=C["danger"])
-                widgets["sha_lbl"].config(text="Sin conexión o repo no disponible", fg=C["danger"])
+                widgets["sha_lbl"].config(
+                    text="Sin conexión o repo no disponible", fg=C["danger"])
                 self._log_write(f"  ❌ {fname} — error de red.", "err")
 
         # ── Banner ────────────────────────────────────────────────────────
         total_pending = updates + missing
         if total_pending > 0:
-            msg_parts = []
+            parts = []
             if updates:
-                msg_parts.append(f"{updates} actualización{'es' if updates != 1 else ''} disponible{'s' if updates != 1 else ''}")
+                parts.append(f"{updates} actualización{'es' if updates != 1 else ''}")
             if missing:
-                msg_parts.append(f"{missing} add-on{'s' if missing != 1 else ''} sin instalar")
-            banner_text = "⚠️  " + "  •  ".join(msg_parts)
-            self._banner_lbl.config(text=banner_text)
+                parts.append(f"{missing} add-on{'s' if missing != 1 else ''} sin instalar")
+            self._banner_lbl.config(text="⚠️  " + "  •  ".join(parts))
             self._banner_frame.config(bg=C["warn"])
             self._banner_lbl.config(bg=C["warn"])
             self._update_all_btn.pack(side="right", padx=12, pady=4)
             self._banner_frame.pack(fill="x", after=self.winfo_children()[0])
             self._log_write(f"\n  → {total_pending} elemento(s) pendiente(s).", "warn")
         else:
-            # All ok or errors only
             has_ok = any(i["status"] == "ok" for i in results.values())
             if has_ok:
-                ver_text = "✅  Todo al día"
                 self._banner_frame.config(bg=C["ok"])
-                self._banner_lbl.config(text=ver_text, bg=C["ok"], fg="#000000")
+                self._banner_lbl.config(text="✅  Todo al día", bg=C["ok"], fg="#000000")
                 self._update_all_btn.pack_forget()
                 self._banner_frame.pack(fill="x", after=self.winfo_children()[0])
                 self._log_write("\n  ✅ Todo está al día.", "ok")
@@ -519,15 +614,21 @@ class UpdaterTab(tk.Frame):
         if not info:
             self._log_write(f"❌ No hay datos para {fname}", "err")
             return
-        status = info["status"]
-        action = "instalar" if status == "missing" else "actualizar"
 
-        if not messagebox.askyesno(
-            "Confirmar",
+        is_self = info.get("is_self", False)
+        action  = "instalar" if info["status"] == "missing" else "actualizar"
+
+        confirm_msg = (
             f"¿{action.capitalize()} '{fname}'?\n\n"
-            f"El archivo se descargará de GitHub y se guardará en:\n{APP_DIR}",
-            parent=self._app,
-        ):
+            f"Se descargará de GitHub y se guardará en:\n{APP_DIR}"
+        )
+        if is_self:
+            confirm_msg += (
+                "\n\n⚠️  Este es el propio plugin de actualización.\n"
+                "Deberás reiniciar FyreWall para aplicar los cambios."
+            )
+
+        if not messagebox.askyesno("Confirmar", confirm_msg, parent=self._app):
             return
 
         self._log_write(f"\n  ▶  {action.capitalize()}ando {fname}...", "info")
@@ -538,37 +639,39 @@ class UpdaterTab(tk.Frame):
 
         def run():
             ok, msg = apply_update(info)
-            self.after(0, lambda o=ok, m=msg, f=fname: self._after_install(o, m, f))
+            self.after(0, lambda o=ok, m=msg, f=fname, s=is_self:
+                       self._after_install(o, m, f, s))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _after_install(self, ok: bool, msg: str, fname: str):
-        tag = "ok" if ok else "err"
-        self._log_write(f"  {msg}", tag)
+    def _after_install(self, ok: bool, msg: str, fname: str, is_self: bool):
+        self._log_write(f"  {msg}", "ok" if ok else "err")
         widgets = self._row_widgets.get(fname, {})
         for btn_key in ("install", "update"):
             if widgets.get(btn_key):
                 widgets[btn_key].config(state="normal")
 
         if ok:
-            # Re-check this file
-            self._do_check()
-            if fname != MAIN_FILE and _app_ref:
-                # Reload plugin in FyreManager
-                try:
-                    path = os.path.join(APP_DIR, fname)
-                    from importlib import import_module
-                    import fyreupdater as _self_mod
-                    # Trigger global reload
-                    _load_plugin_external(path)
-                    self._log_write(f"  🔄 Plugin {fname} recargado en FyreManager.", "info")
-                except Exception:
-                    self._log_write(f"  ℹ️  Reinicia FyreWall para activar {fname}.", "muted")
+            if is_self:
+                self._log_write(
+                    "  ℹ️  FyreUpdater actualizado. Reinicia FyreWall para aplicar los cambios.",
+                    "muted",
+                )
             elif fname == MAIN_FILE:
                 self._log_write(
                     "  ℹ️  fyrewall.py actualizado. Reinicia la aplicación para aplicar los cambios.",
-                    "muted"
+                    "muted",
                 )
+            else:
+                # Hot-reload add-on
+                try:
+                    path = os.path.join(APP_DIR, fname)
+                    _load_plugin_external(path)
+                    self._log_write(f"  🔄 Plugin {fname} recargado en FyreManager.", "info")
+                except Exception:
+                    self._log_write(
+                        f"  ℹ️  Reinicia FyreWall para activar {fname}.", "muted")
+            self._do_check()
 
     def _update_all(self):
         pending = {
@@ -579,13 +682,17 @@ class UpdaterTab(tk.Frame):
             self._log_write("  ℹ️  No hay nada que actualizar.", "muted")
             return
 
-        names = ", ".join(pending.keys())
-        if not messagebox.askyesno(
-            "Actualizar todo",
-            f"¿Actualizar / instalar los siguientes archivos?\n\n{names}\n\n"
-            "Los archivos actuales se guardarán como .bak",
-            parent=self._app,
-        ):
+        has_self    = any(info.get("is_self") for info in pending.values())
+        has_main    = MAIN_FILE in pending
+        names       = ", ".join(pending.keys())
+
+        confirm_msg = f"¿Actualizar / instalar los siguientes archivos?\n\n{names}\n\nLos archivos actuales se guardarán como .bak"
+        if has_self:
+            confirm_msg += "\n\n⚠️  Incluye FyreUpdater — requiere reinicio."
+        if has_main:
+            confirm_msg += "\n\n⚠️  Incluye fyrewall.py — requiere reinicio."
+
+        if not messagebox.askyesno("Actualizar todo", confirm_msg, parent=self._app):
             return
 
         self._log_write(f"\n  ▶  Actualizando {len(pending)} elemento(s)...", "header")
@@ -600,13 +707,16 @@ class UpdaterTab(tk.Frame):
 
         threading.Thread(target=run, daemon=True).start()
 
-    # ── Log ───────────────────────────────────────────────────────────────
+    # ── Log helpers ───────────────────────────────────────────────────────
 
     def _log_write(self, text: str, tag: str = "info"):
-        self._log.configure(state="normal")
-        self._log.insert("end", text + "\n", tag)
-        self._log.configure(state="disabled")
-        self._log.see("end")
+        try:
+            self._log.configure(state="normal")
+            self._log.insert("end", text + "\n", tag)
+            self._log.configure(state="disabled")
+            self._log.see("end")
+        except Exception:
+            pass  # log may be rebuilding
 
     def _clear_log(self):
         self._log.configure(state="normal")
@@ -623,9 +733,6 @@ def _build_updater_tab(parent_frame, app_ref=None):
 
 
 # ── FyreManager GUI integration ───────────────────────────────────────────────
-# Adds a blue "🔄 Actualizar" button to every package row in FyreManager's
-# GUI list, placed to the LEFT of the red "🗑 Eliminar" button.
-# This is injected at runtime by patching FyreManagerTab._populate_gui_list.
 
 def _inject_update_button_into_manager():
     """
@@ -634,8 +741,6 @@ def _inject_update_button_into_manager():
     Also registers 'get-update' in the CLI autocomplete.
     """
     try:
-        # Import the main module — it's already loaded as __main__ or via importlib
-        import sys
         main_mod = None
         for mod_name, mod in sys.modules.items():
             if hasattr(mod, "FyreManagerTab") and hasattr(mod, "_PLUGINS"):
@@ -644,17 +749,15 @@ def _inject_update_button_into_manager():
         if main_mod is None:
             return
 
-        FyreManagerTab = main_mod.FyreManagerTab
+        FyreManagerTab   = main_mod.FyreManagerTab
         original_populate = FyreManagerTab._populate_gui_list
 
         def patched_populate(self_mgr):
             original_populate(self_mgr)
-            # After the original builds all rows, find the rows and add button
             _add_update_btns_to_gui(self_mgr, main_mod)
 
         FyreManagerTab._populate_gui_list = patched_populate
 
-        # Also register the get-update command in the main CLI autocomplete
         cmds = main_mod.COMMANDS
         existing_names = {c for c, _ in cmds}
         if "get-update" not in existing_names:
@@ -669,8 +772,6 @@ def _add_update_btns_to_gui(mgr, main_mod):
     try:
         gui_list = mgr._gui_list
         for row_widget in gui_list.winfo_children():
-            # Each row has a right-aligned "🗑 Eliminar" button; we add before it
-            # Find the filename from the Labels inside
             fname = None
             for w in row_widget.winfo_children():
                 if isinstance(w, tk.Frame):
@@ -686,7 +787,6 @@ def _add_update_btns_to_gui(mgr, main_mod):
                         fname = txt
                         break
             if fname:
-                # Check if update button already added
                 already = any(
                     isinstance(w, tk.Button) and "Actualizar" in (w.cget("text") or "")
                     for w in row_widget.winfo_children()
@@ -704,7 +804,6 @@ def _add_update_btns_to_gui(mgr, main_mod):
 
 
 def _get_delete_btn(row):
-    """Return the first red delete button in the row, or None."""
     for w in row.winfo_children():
         if isinstance(w, tk.Button) and "Eliminar" in (w.cget("text") or ""):
             return w
@@ -716,28 +815,35 @@ def _quick_update_file(fname: str, mgr, main_mod):
     mgr._write(f"\n🔄  Comprobando actualización de {fname}...", "info")
 
     def run():
-        # Determine repo
-        repo = MAIN_REPO if fname == MAIN_FILE else ADDONS_REPO
-        local_path = os.path.join(APP_DIR, fname)
-        local_sha  = _local_sha256(local_path)
+        repo = MAIN_REPO if fname in (MAIN_FILE, UPDATER_FILE) else ADDONS_REPO
+        local_path  = os.path.join(APP_DIR, fname)
+        local_sha   = _local_sha256(local_path)
         remote_data = _raw_get(repo, "main", fname)
         if remote_data is None:
-            mgr.after(0, lambda: mgr._write(f"  ❌ No se pudo descargar {fname} (sin red o no encontrado).", "error"))
+            mgr.after(0, lambda: mgr._write(
+                f"  ❌ No se pudo descargar {fname} (sin red o no encontrado).", "error"))
             return
         remote_sha = _sha256(remote_data)
         if local_sha == remote_sha:
             mgr.after(0, lambda: mgr._write(f"  ✅ {fname} ya está al día.", "ok"))
             return
-        info = {"repo": repo, "branch": "main", "file": fname, "_data": remote_data,
-                "local_sha": local_sha, "remote_sha": remote_sha,
-                "status": "update" if local_sha else "missing"}
+        info = {
+            "repo": repo, "branch": "main", "file": fname,
+            "_data": remote_data, "local_sha": local_sha, "remote_sha": remote_sha,
+            "status": "update" if local_sha else "missing",
+            "is_self": fname == UPDATER_FILE,
+        }
         ok, msg = apply_update(info)
         mgr.after(0, lambda o=ok, m=msg: mgr._write(f"  {m}", "ok" if o else "error"))
-        if ok and fname != MAIN_FILE:
+        if ok and fname not in (MAIN_FILE, UPDATER_FILE):
             try:
                 _load_plugin_external(os.path.join(APP_DIR, fname))
             except Exception:
                 pass
+        elif ok and fname == UPDATER_FILE:
+            mgr.after(0, lambda: mgr._write(
+                "  ℹ️  FyreUpdater actualizado. Reinicia FyreWall para aplicar los cambios.",
+                "info"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -745,7 +851,6 @@ def _quick_update_file(fname: str, mgr, main_mod):
 def _load_plugin_external(path: str):
     """Reload a plugin file into the FyreWall plugin registry."""
     try:
-        import sys
         for mod_name, mod in sys.modules.items():
             if hasattr(mod, "_load_plugin") and hasattr(mod, "_PLUGINS"):
                 mod._load_plugin(path)
@@ -761,7 +866,6 @@ def _cmd_get_update(args):
     return "__PLUGIN_TAB__fyreupdater.py::get-update", "info"
 
 
-# Update the manifest commands to point to the correct handler
 FYRE_MANIFEST["commands"][0]["handler"] = "_cmd_get_update"
 
 # ── Entry point (standalone test) ─────────────────────────────────────────────
