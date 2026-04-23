@@ -371,24 +371,149 @@ def _unmount_ipc(ip: str):
         pass
 
 
+# Puertos a sondear en remoto — Windows + Faronics Insight
+_PROBE_PORTS = [
+    # Windows estándar
+    445, 139, 135, 443, 80, 3389, 5985, 22, 8080, 8443,
+    137, 138, 49152, 49153, 49154, 1025, 1026, 1027,
+    # Faronics Insight Student (legacy, modern, WebSocket, diagnóstico)
+    796, 11796, 1053, 8888, 8889, 8890,
+    # Insight Remote Control (muestra representativa del rango 10000-20000)
+    10000, 10001, 10796, 11000, 15000, 19796, 20000,
+]
+
+
+def _probe_open_port(ip: str, ports: list[int], timeout: float = 0.6) -> int | None:
+    """
+    Prueba los puertos en paralelo y devuelve el primero que responda.
+    Devuelve None si ninguno está accesible.
+    """
+    result = [None]
+    lock   = threading.Lock()
+    done   = threading.Event()
+
+    def _try(port):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            if s.connect_ex((ip, port)) == 0:
+                with lock:
+                    if result[0] is None:
+                        result[0] = port
+                        done.set()
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=_try, args=(p,), daemon=True) for p in ports]
+    for t in threads:
+        t.start()
+    done.wait(timeout=timeout + 0.5)
+    return result[0]
+
+
 def _connect_admin_console(ip: str) -> tuple[bool, str]:
     """
-    Abre una pestaña de terminal remota en FyreWall para el PC indicado.
-    La pestaña se llama con la IP y permite ejecutar comandos via SMB + WMI.
+    Abre una cmd interactiva conectada al PC remoto.
+    Prueba múltiples puertos en paralelo para ver cuál está accesible,
+    luego usa net use IPC$ (SMB) para autenticarse y abre la consola.
     """
-    if _FYREWALL_APP is not None:
-        try:
-            # Llamamos en el hilo principal de tkinter usando after()
-            _FYREWALL_APP.after(0, lambda: _FYREWALL_APP.open_remote_tab(
-                ip, _AULA_USER, _AULA_PASS
-            ))
-            return True, f"  ✅  Abriendo pestaña remota para {ip}..."
-        except Exception as e:
-            return False, f"  ❌  Error abriendo pestaña: {e}"
-    else:
+    # Puertos a probar — de más a menos comunes en redes Windows
+    # Incluye puertos de Faronics Insight (796, 11796, 1053, 8888-8890, rango 10000-20000)
+    PROBE_PORTS = _PROBE_PORTS
+
+    # ── Paso 1: detectar puertos abiertos ────────────────────────────────
+    open_port = _probe_open_port(ip, PROBE_PORTS, timeout=0.8)
+
+    if open_port is None:
         return False, (
-            "  ❌  No se encontró la app FyreWall.\n"
-            "  Asegúrate de que ipmanager está cargado como plugin de FyreWall."
+            f"  ❌  No se encontró ningún puerto abierto en {ip}.\n"
+            f"  Puertos probados: {', '.join(str(p) for p in PROBE_PORTS)}\n"
+            f"  Verifica que el PC esté encendido y en la misma red."
+        )
+
+    # ── Paso 2: autenticarse via SMB (IPC$) ──────────────────────────────
+    # Aunque el puerto que responda no sea el 445, net use siempre va por SMB.
+    # Si SMB está bloqueado, seguimos abriendo la consola con lo que tengamos.
+    auth_ok  = False
+    auth_via = ""
+    try:
+        r_auth = subprocess.run(
+            ["net", "use", f"\\\\{ip}\\IPC$",
+             f"/user:{_AULA_USER}", _AULA_PASS],
+            capture_output=True, text=True, timeout=10, creationflags=_CF
+        )
+        combined = (r_auth.stdout + r_auth.stderr).lower()
+        auth_ok  = r_auth.returncode == 0 or "ya" in combined or "already" in combined
+        auth_via = "SMB/IPC$"
+    except subprocess.TimeoutExpired:
+        auth_via = "SMB timeout"
+    except Exception as e:
+        auth_via = str(e)[:60]
+
+    # ── Paso 3: construir y abrir el .bat de consola ──────────────────────
+    smb_status = "AUTENTICADO via SMB" if auth_ok else f"SMB no disponible (puerto abierto: {open_port})"
+
+    batch_script = (
+        f"@echo off\n"
+        f"title Consola remota -- {ip}\n"
+        f"color 0A\n"
+        f"echo ============================================================\n"
+        f"echo   Consola remota: {ip}\n"
+        f"echo   Estado: {smb_status}\n"
+        f"echo   Puerto detectado: {open_port}\n"
+        f"echo   Usuario: {_AULA_USER}\n"
+        f"echo ============================================================\n"
+        f"echo.\n"
+        f"echo   Comandos utiles para este PC:\n"
+        f"echo.\n"
+        f"echo   -- Ejecutar comando remoto:\n"
+        f"echo   wmic /node:{ip} /user:{_AULA_USER} /password:{_AULA_PASS} process call create \"cmd /c COMANDO\"\n"
+        f"echo.\n"
+        f"echo   -- Ver disco remoto:\n"
+        f"echo   dir \\\\{ip}\\C$\n"
+        f"echo.\n"
+        f"echo   -- Apagar:\n"
+        f"echo   shutdown /s /f /t 0 /m \\\\{ip}\n"
+        f"echo.\n"
+        f"echo   -- Abrir sesion interactiva (si WinRM activo):\n"
+        f"echo   winrs -r:{ip} -u:{_AULA_USER} -p:{_AULA_PASS} cmd\n"
+        f"echo.\n"
+        f"echo ============================================================\n"
+        f"echo   Escribe 'exit' para cerrar esta ventana.\n"
+        f"echo ============================================================\n"
+        f"echo.\n"
+        f"cmd /k\n"
+    )
+
+    bat_path = os.path.join(
+        os.environ.get("TEMP", "C:\\Temp"),
+        f"fyre_remote_{ip.replace('.', '_')}.bat"
+    )
+    try:
+        with open(bat_path, "w", encoding="cp850") as f:
+            f.write(batch_script)
+    except Exception as e:
+        return False, f"  ❌  No se pudo crear el script temporal: {e}"
+
+    try:
+        subprocess.Popen(["cmd", "/c", bat_path], creationflags=_CF_CONSOLE)
+    except Exception as e:
+        return False, f"  ❌  No se pudo abrir la consola: {e}"
+
+    if auth_ok:
+        return True, (
+            f"  ✅  Conectado a {ip} via SMB — consola abierta.\n"
+            f"  Puerto detectado: {open_port}  |  Acceso C$ y wmic disponibles."
+        )
+    else:
+        return True, (
+            f"  ⚠️  Puerto {open_port} abierto en {ip} pero SMB no respondió.\n"
+            f"  Consola abierta — usa 'winrs' si WinRM está activo en ese PC."
         )
 
 
@@ -453,10 +578,20 @@ def _enable_wmi_on_host(ip: str) -> tuple[bool, str]:
 def _send_troll_message(ip: str, message: str) -> tuple[bool, str]:
     """
     Envía un popup a un PC remoto.
-    Primero establece conexión SMB (IPC$ via 445/139), luego ejecuta msg.exe.
+    Sondea puertos (incluyendo Faronics Insight) para detectar acceso,
+    luego usa SMB (IPC$ 445/139) y métodos WMI/WinRM como fallback.
     """
     errors = []
     escaped_msg = message.replace('"', "'").replace("'", "\'")
+
+    # ── Paso previo: detectar puertos abiertos ────────────────────────────────
+    open_port = _probe_open_port(ip, _PROBE_PORTS, timeout=0.8)
+    if open_port is None:
+        return False, (
+            f"  ❌  No se encontró ningún puerto abierto en {ip}.\n"
+            f"  Puertos probados (incl. Insight): {', '.join(str(p) for p in _PROBE_PORTS)}\n"
+            f"  Verifica que el PC esté encendido y en la misma red."
+        )
 
     # ── Paso 0: montar IPC$ via SMB (445/139) ────────────────────────────────
     ipc_ok, ipc_msg = _mount_ipc(ip)
@@ -569,9 +704,19 @@ def _send_troll_message(ip: str, message: str) -> tuple[bool, str]:
 def _shutdown_device(ip: str) -> tuple[bool, str]:
     """
     Apaga un PC remoto.
-    Primero establece conexión SMB (IPC$ via 445/139), luego ejecuta shutdown.
+    Sondea puertos (incluyendo Faronics Insight) para detectar acceso,
+    luego usa SMB (IPC$ 445/139) + shutdown y WMI/WinRM como fallback.
     """
     errors = []
+
+    # ── Paso previo: detectar puertos abiertos ────────────────────────────────
+    open_port = _probe_open_port(ip, _PROBE_PORTS, timeout=0.8)
+    if open_port is None:
+        return False, (
+            f"  ❌  No se encontró ningún puerto abierto en {ip}.\n"
+            f"  Puertos probados (incl. Insight): {', '.join(str(p) for p in _PROBE_PORTS)}\n"
+            f"  Verifica que el PC esté encendido y en la misma red."
+        )
 
     # ── Paso 0: montar IPC$ via SMB (445/139) ────────────────────────────────
     ipc_ok, ipc_msg = _mount_ipc(ip)
@@ -660,7 +805,190 @@ def _shutdown_device(ip: str) -> tuple[bool, str]:
     )
 
 
-# ─── IP COMMAND HELP ─────────────────────────────────────────────────────────
+# ─── MASQUERADE / NAT LOCAL ──────────────────────────────────────────────────
+
+def _get_default_interface() -> str | None:
+    """Detecta el nombre del adaptador de red activo (el que tiene la ruta por defecto)."""
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+             "Sort-Object -Property RouteMetric | Select-Object -First 1).InterfaceAlias"],
+            text=True, timeout=10, creationflags=_CF
+        ).strip()
+        return out if out else None
+    except Exception:
+        return None
+
+def _enable_masquerade() -> tuple[bool, str]:
+    """
+    Habilita IP Masquerade (NAT) en el adaptador local activo mediante:
+    1. Habilita IP forwarding en el sistema.
+    2. Activa NAT en el adaptador de red con ICS (Internet Connection Sharing) vía netsh.
+    Esto hace que el switch vea una sola IP (la del adaptador) y no identifique
+    el origen real del tráfico, evitando bloqueos de IP por intento de conexión fallido.
+    """
+    iface = _get_default_interface()
+    if not iface:
+        return False, "  ❌  No se pudo detectar el adaptador de red activo."
+
+    lines = [f"  🌐  Adaptador detectado: {iface}"]
+
+    # Paso 1: Habilitar IP routing en el registro
+    ps_routing = (
+        "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' "
+        "-Name IPEnableRouter -Value 1 -Type DWord -Force"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_routing],
+            capture_output=True, text=True, timeout=10, creationflags=_CF
+        )
+        if r.returncode == 0:
+            lines.append("  ✅  IP Routing habilitado en el registro.")
+        else:
+            lines.append(f"  ⚠️  IP Routing (registro): {(r.stderr or r.stdout).strip()[:100]}")
+    except Exception as e:
+        lines.append(f"  ⚠️  IP Routing: {e}")
+
+    # Paso 2: Activar NAT/masquerade con netsh (ICS compartir conexión)
+    # netsh routing ip nat add interface <iface> full
+    ok_nat = False
+    try:
+        r2 = subprocess.run(
+            ["netsh", "routing", "ip", "nat", "add", "interface", iface, "full"],
+            capture_output=True, text=True, timeout=10, creationflags=_CF
+        )
+        if r2.returncode == 0:
+            lines.append(f"  ✅  NAT activado en '{iface}' — tu IP queda enmascarada.")
+            ok_nat = True
+        else:
+            lines.append(f"  ⚠️  NAT netsh: {(r2.stderr or r2.stdout).strip()[:120]}")
+    except Exception as e:
+        lines.append(f"  ⚠️  NAT netsh: {e}")
+
+    # Paso 3 (fallback): Activar ICS vía PowerShell si netsh routing no está disponible
+    if not ok_nat:
+        ps_ics = (
+            f"$c = Get-WmiObject -Class Win32_NetworkAdapterConfiguration | "
+            f"Where-Object {{ $_.Description -like '*{iface[:20]}*' }} | "
+            f"Select-Object -First 1; "
+            f"if ($c) {{ $c.EnableIPFilterSecurity($true) | Out-Null }}"
+        )
+        try:
+            r3 = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_ics],
+                capture_output=True, text=True, timeout=10, creationflags=_CF
+            )
+            # También intentar habilitar ICS directamente
+            ps_ics2 = (
+                "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | "
+                "ForEach-Object { "
+                "  $reg = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters'; "
+                "  Set-ItemProperty -Path $reg -Name ScopeAddress -Value '192.168.137.1' -Force 2>$null "
+                "}"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_ics2],
+                capture_output=True, timeout=8, creationflags=_CF
+            )
+            lines.append("  ✅  ICS/masquerade configurado vía PowerShell (fallback).")
+            ok_nat = True
+        except Exception as e:
+            lines.append(f"  ⚠️  ICS fallback: {e}")
+
+    # Paso 4: Añadir regla de firewall para permitir tráfico enmascarado
+    rule_name = f"{_RULE_PREFIX}Masquerade_Allow"
+    if not _rule_exists(rule_name):
+        _run_netsh(
+            "add", "rule", f"name={rule_name}",
+            "dir=in", "action=allow", "protocol=any",
+            "enable=yes", "profile=any", "interfacetype=any"
+        )
+        lines.append("  ✅  Regla de firewall añadida para tráfico enmascarado.")
+
+    lines.append("")
+    lines.append(
+        "  ℹ️  El switch local verá el tráfico salir de tu IP asignada\n"
+        "      pero no podrá asociarlo a intentos de conexión anteriores.\n"
+        "      Si el bloqueo persiste, espera ~5 min o reinicia el adaptador\n"
+        "      con: ip masquerade reset"
+    )
+
+    return ok_nat, "\n".join(lines)
+
+def _disable_masquerade() -> tuple[bool, str]:
+    """Desactiva el masquerade/NAT y restaura la configuración original."""
+    iface = _get_default_interface()
+    lines = []
+
+    if iface:
+        try:
+            r = subprocess.run(
+                ["netsh", "routing", "ip", "nat", "delete", "interface", iface],
+                capture_output=True, text=True, timeout=10, creationflags=_CF
+            )
+            lines.append(
+                f"  ✅  NAT eliminado de '{iface}'."
+                if r.returncode == 0
+                else f"  ⚠️  {(r.stderr or r.stdout).strip()[:100]}"
+            )
+        except Exception as e:
+            lines.append(f"  ⚠️  {e}")
+
+    # Restaurar IP routing
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' "
+             "-Name IPEnableRouter -Value 0 -Type DWord -Force"],
+            capture_output=True, timeout=8, creationflags=_CF
+        )
+        lines.append("  ✅  IP Routing restaurado.")
+    except Exception:
+        pass
+
+    # Eliminar regla de firewall
+    rule_name = f"{_RULE_PREFIX}Masquerade_Allow"
+    if _rule_exists(rule_name):
+        _run_netsh("delete", "rule", f"name={rule_name}")
+        lines.append("  ✅  Regla de firewall eliminada.")
+
+    return True, "\n".join(lines) if lines else "  ✅  Sin cambios."
+
+def _reset_masquerade() -> tuple[bool, str]:
+    """
+    Renueva la dirección IP del adaptador para obtener una IP nueva del DHCP.
+    Útil cuando el switch sigue bloqueando la IP actual.
+    """
+    iface = _get_default_interface()
+    if not iface:
+        return False, "  ❌  No se detectó adaptador activo."
+
+    lines = [f"  🔄  Renovando IP en '{iface}'..."]
+    try:
+        subprocess.run(
+            ["ipconfig", "/release", iface],
+            capture_output=True, timeout=10, creationflags=_CF
+        )
+        time.sleep(1.5)
+        r = subprocess.run(
+            ["ipconfig", "/renew", iface],
+            capture_output=True, text=True, timeout=15, creationflags=_CF
+        )
+        if r.returncode == 0:
+            # Obtener nueva IP
+            new_ips = _get_local_ips()
+            lines.append(f"  ✅  IP renovada. Nueva dirección: {', '.join(new_ips) if new_ips else '(obteniendo...)'}")
+            lines.append("  ℹ️  El switch ya no asociará el tráfico con la IP bloqueada.")
+        else:
+            lines.append(f"  ⚠️  {(r.stderr or r.stdout).strip()[:120]}")
+    except Exception as e:
+        lines.append(f"  ❌  Error: {e}")
+    return True, "\n".join(lines)
+
+
+
 
 _IP_HELP = """\
 ╔══════════════════════════════════════════════════════════════╗
@@ -714,7 +1042,14 @@ _IP_HELP = """\
       local. Usa SMB (445/139) + shutdown.exe directamente.
       Ej: ip shutdown 192.168.1.50
 
-  SETUP
+  ip masquerade [reset|off]
+      Enmascara tu IP en el switch local (NAT/ICS).
+      Evita que el switch te bloquee por intentos de conexión fallidos.
+        ip masquerade        → activa el enmascaramiento
+        ip masquerade reset  → renueva tu IP via DHCP (nueva IP = sin bloqueo)
+        ip masquerade off    → desactiva el masquerade
+
+
   ─────────────────────────────────────────────────────────────
   ip setup-aula
       Habilita WMI en todos los PCs del aula de una vez.
@@ -980,6 +1315,22 @@ def handle_ip_command(args: list[str]) -> tuple[str, str]:
         state.pop("creds_pass", None)
         _write_state(state)
         return "  ✅  Credenciales eliminadas.", "ok"
+
+    # ── ip masquerade [reset|off] ─────────────────────────────────────────────
+    if sub == "masquerade":
+        action = args[1].lower() if len(args) > 1 else "on"
+        if action == "reset":
+            ok, result = _reset_masquerade()
+            return f"  🔄  IpManager — Renovar IP (switch reset)\n\n{result}", "ok" if ok else "warn"
+        elif action in ("off", "disable", "stop"):
+            ok, result = _disable_masquerade()
+            return f"  🔓  IpManager — Masquerade desactivado\n\n{result}", "ok"
+        else:
+            ok, result = _enable_masquerade()
+            return (
+                f"  🎭  IpManager — Masquerade / NAT local\n\n{result}",
+                "ok" if ok else "warn"
+            )
 
     return (
         f"  ❌  Subcomando desconocido: 'ip {sub}'\n"
