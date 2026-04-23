@@ -1,0 +1,25 @@
+{
+  "addons": [
+    {
+      "file":        "dayus.py",
+      "name":        "Dayus",
+      "description": "Gestión de días y calendario",
+      "author":      "FyreWall",
+      "version":     "1.0.0"
+    },
+    {
+      "file":        "ipmanager.py",
+      "name":        "IP Manager",
+      "description": "Gestión y monitoreo de IPs",
+      "author":      "FyreWall",
+      "version":     "1.1.0"
+    },
+    {
+      "file":        "tabshortcuts.py",
+      "name":        "Tab Shortcuts",
+      "description": "Atajos de teclado para pestañas",
+      "author":      "FyreWall",
+      "version":     "1.0.2"
+    }
+  ]
+}
